@@ -70,8 +70,8 @@ int round_counter=1;
 /* vars used for reading obstacles */
 int I = 10;
 int Q = 5;
-float T = 0.5;
-float W = 2.0;
+float T = 0.9;
+float W = 3.0;
 
 /* vars used for sensors sampling */
 time_t base_time;
@@ -79,7 +79,9 @@ time_t current_time;
 time_t delta_time;
 unsigned int readyForSample;
 int * samplesCounterBuffer;
-int ** samplesBuffer;
+float ** samplesBuffer;
+float * means;
+
 
 
 //prototypes
@@ -96,9 +98,9 @@ int main(int argc, const char * argv[])
 {
 	//vars for process creation
 	int i;
-  int shm_status;
-  pid_t pid;
-  pid_t *pidp;
+  	int shm_status;
+  	pid_t pid;
+  	pid_t *pidp;
 	char sem_name[10];
   
 	//vars for threads creation
@@ -116,6 +118,13 @@ int main(int argc, const char * argv[])
 
 	//vars for samples buffer checking
 	unsigned int samplesTaken= FALSE;
+	unsigned int samplesBufferFull= FALSE;
+	unsigned int isVehicle= FALSE;
+	unsigned int isObstacle= FALSE;
+	float acum=0.0;
+	float lasersMean;
+	float lstdev=0;
+	int j;
 
 
 	//registering the handler for SIGCHILD signal
@@ -215,11 +224,12 @@ int main(int argc, const char * argv[])
 	buffg_out= (int *) calloc((int) processes_count / 2,sizeof(int));
 	
 	//Allocating samples and counters Buffer 
-	samplesBuffer= (int **) malloc(sizeof(int *) * (int) processes_count / 2);
+	samplesBuffer= (float **) malloc(sizeof(float *) * (int) processes_count / 2);
 	for(i=0; i < (int) processes_count / 2; i++){
-			samplesBuffer[i]= (int *) calloc(Q,sizeof(int));
+			samplesBuffer[i]= (float *) calloc(Q,sizeof(float));
 	}
 	samplesCounterBuffer= (int *) calloc(processes_count,sizeof(int));
+	means= calloc((int) processes_count / 2, sizeof(float));
 
 	//Buffer mutex allocation and creation
 	for(i= 0; i < (int) processes_count / 2 ; i++){
@@ -268,11 +278,11 @@ int main(int argc, const char * argv[])
 
 	base_time= time(NULL);
 	while(1){
-  	sleep(1);
+  		sleep(1);
 
 		current_time= time(NULL);
 		delta_time= current_time - base_time;
-		if(delta_time >= I){
+		if(delta_time >= I && readyForSample == FALSE){
 			fprintf(stderr,"TAKING %d SAMPLES!\n ",Q);
 			readyForSample= TRUE;
 			base_time= time(NULL);
@@ -294,6 +304,78 @@ int main(int argc, const char * argv[])
 			fprintf(stderr,"SAMPLES TAKEN, RESTARTING INTERVAL\n ");
 			base_time= time(NULL);
 			samplesTaken=FALSE;
+		}
+
+		samplesBufferFull=TRUE;
+		for(i=0;i < (int)processes_count / 2; i++){
+			if(samplesBuffer[i][Q -1] == 0){
+				samplesBufferFull=FALSE;
+				break;
+			}
+		}
+		
+		if(samplesBufferFull){
+			fprintf(stderr,"VALUES BUFFER IS FULL, PROCEED TO CALCULATE...\n");
+			lasersMean=0;
+			lstdev= 0;
+			for(i=0; i < (int)processes_count / 2; i++){
+				acum= 0.0;
+				for(j= 0; j< Q; j++){
+					acum+= samplesBuffer[i][j];
+					samplesBuffer[i][j]=0;
+				}
+				means[i]= acum / Q;
+				lasersMean+= means[i];
+				fprintf(stderr,"||LASER %d mean distance: %.2f||\n",i,means[i]);
+			}
+			lasersMean= lasersMean / ((float) processes_count / 2);
+			for(i=0; i< (int) processes_count / 2; i++){
+				lstdev+= pow(means[i] - lasersMean,2);
+			}
+			lstdev= sqrt(lstdev / ((int) processes_count / 2));
+			fprintf(stderr,"||Standard dev: %.2f||\n",lstdev);
+
+			//We always assume that the first laser sensor is the CENTRAL LASER
+
+			isVehicle=TRUE;
+			fprintf(stderr,"VALUE OF VH TRESHOLD: %.2f\n",T * lstdev);
+			for(i=1; i< (int) processes_count / 2; i++){
+				fprintf(stderr,"DIFFERENCE: %.2f\n",fabs(means[0] - means[i]));
+				if(fabs(means[0] - means[i]) > (T * lstdev)){
+					isVehicle= FALSE;
+				}
+				if(fabs(means[0] - means[i]) >= (W * lstdev)){
+					isObstacle= TRUE;
+				}
+			}
+
+			if(isVehicle){
+				fprintf(stderr,"\n>>>>Object is a VEHICLE<<<<\n");
+				continue;
+			}
+			
+			if(!isObstacle){
+				fprintf(stderr,"VALUE OF OB TRESHOLD: %.2f\n",W * lstdev);
+				for(i=1; i< (int) processes_count / 2; i++){
+					for(j= i + 1; j< (int) processes_count / 2; j++){
+						fprintf(stderr,"DIFFERENCE: %.2f\n",fabs(means[i] - means[j]));
+						if(fabs(means[i] - means[j]) >= (W * lstdev)){
+							isObstacle= TRUE;
+							break;
+						}
+					}
+				}
+			}
+
+			if(isObstacle){
+				fprintf(stderr,"\n>>>>Object is a OBSTACLE<<<<\n");
+				continue;
+			}
+
+			if(!isVehicle && !isObstacle){
+				fprintf(stderr,"\n<<<<Object is UNKNOWN>>>>\n");
+			}
+
 		}
 		/*/Analytics code
 		elapsed_time= time(NULL);
@@ -421,10 +503,10 @@ void *main_calculator(void *param){
 	float result=0;	
 	int num_readings=0;
 	char gscopeString[SHMSZ];
+	int sampleIndex= 0;
 	
 	while(1){
 		sleep(1);
-		
 		sem_wait(&buffer_mutexes[buffer_index]);
 		
 		distance= atof(distanceBuffer[buffer_index][buffd_out[buffer_index] % BUFFER_SIZE]);
@@ -432,8 +514,17 @@ void *main_calculator(void *param){
 		
 		sem_post(&buffer_mutexes[buffer_index]);
 		
+		if(sampleIndex == Q){
+			sampleIndex=0;
+		}
+
 		if( distance!=0 && angle!=0){
-			result= distance * cos(angle * (M_PI/180));			
+			result= distance * cos(angle * (M_PI/180));	
+
+			samplesBuffer[buffer_index][sampleIndex]= result;
+			sampleIndex++;
+			//fprintf(stderr,"SAMPLE INDEX OF %d: %d",buffer_index,sampleIndex);
+
 			fprintf(reslogfp,"result of Laser %d distance %f and Gscope %d angle %f: %.3f \n",
 												shmem_ids[2 * buffer_index],
 												distance,
@@ -454,6 +545,11 @@ void *main_calculator(void *param){
 			else{
 				result= distance * cos((angles_sum / num_readings) * (M_PI/180));
 			}
+
+			samplesBuffer[buffer_index][sampleIndex]= result;
+			sampleIndex++;
+			//fprintf(stderr,">>SAMPLE INDEX OF %d: %d\n",buffer_index,sampleIndex);
+
 			fprintf(reslogfp,"result of Laser %d distance %s and Gscope %d angle %f: %f \n",
 												shmem_ids[2 * buffer_index],
 												distanceBuffer[buffer_index][buffd_out[buffer_index]],
@@ -465,8 +561,6 @@ void *main_calculator(void *param){
 			buffg_out[buffer_index]= (buffg_out[buffer_index] + 1) % BUFFER_SIZE;
 			//op_per_sec++;
 		}
-
-		//Aqui empieza el analisis de los sensores
 
 	}
 	

@@ -29,7 +29,7 @@
 #define SHMSZ     27
 #define MAX_SAMPLES 100
 #define MAX_SAMPLES_THETA 50
-#define DIST 10
+#define DIST 11
 #define PI 3.14159265
         /* ranf() is uniform in 0..1 */
 
