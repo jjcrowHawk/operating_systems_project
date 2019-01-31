@@ -19,6 +19,14 @@
 #define PROC_RST 3
 #define SHMSZ	27
 #define MAX_CONFIG_ARGS 3
+#define TRUE 1
+#define FALSE 0
+
+//TODO
+//> A MECHANISM TO CONTROL THE NUMBER OF SAMPLES OF EACH SENSOR
+//> A MECHANISM TO STORE THE PROCESSED VALUE OF EACH PAIR OF LASER AND GSCOPE SENSOR READINGS
+//> A MECHANISM TO RESET THE INTERVAL TIME
+//> A MECHANISM TO CALCULATE THE MEAN OF EACH SAMPLES BUFFER
 
 /* vars for processes control */
 int processes_count=0;
@@ -39,10 +47,6 @@ int *buffd_in;
 int *buffg_in;
 int *buffd_out;
 int *buffg_out;
-//int buffd_in= 0;
-//int buffg_in= 0;
-//int buffd_out= 0;
-//int buffg_out= 0;
 char oldDataValue[SHMSZ];
 
 /* semaphores for sync */
@@ -68,6 +72,14 @@ int I = 10;
 int Q = 5;
 float T = 0.5;
 float W = 2.0;
+
+/* vars used for sensors sampling */
+time_t base_time;
+time_t current_time;
+time_t delta_time;
+unsigned int readyForSample;
+int * samplesCounterBuffer;
+int ** samplesBuffer;
 
 
 //prototypes
@@ -101,6 +113,9 @@ int main(int argc, const char * argv[])
 	const char sep[2]= ",";
 	const char id_sep[2]= "|";
 	const char *config_tokens[3];
+
+	//vars for samples buffer checking
+	unsigned int samplesTaken= FALSE;
 
 
 	//registering the handler for SIGCHILD signal
@@ -198,6 +213,13 @@ int main(int argc, const char * argv[])
 	buffg_in= (int *) calloc((int) processes_count / 2,sizeof(int) );
 	buffd_out= (int *) calloc((int) processes_count / 2,sizeof(int));
 	buffg_out= (int *) calloc((int) processes_count / 2,sizeof(int));
+	
+	//Allocating samples and counters Buffer 
+	samplesBuffer= (int **) malloc(sizeof(int *) * (int) processes_count / 2);
+	for(i=0; i < (int) processes_count / 2; i++){
+			samplesBuffer[i]= (int *) calloc(Q,sizeof(int));
+	}
+	samplesCounterBuffer= (int *) calloc(processes_count,sizeof(int));
 
 	//Buffer mutex allocation and creation
 	for(i= 0; i < (int) processes_count / 2 ; i++){
@@ -223,9 +245,6 @@ int main(int argc, const char * argv[])
     }
      
     if(pid>0){
-			//shmemKey= atoi(argv[i]);
-			//*sensor_keys= shmemKey;
-			//sensor_keys++;
 			keys_count++;
       *pidp= pid;
 			++pidp;
@@ -244,16 +263,38 @@ int main(int argc, const char * argv[])
 	for(i=0; i< (int) processes_count/2; i++){
 		pthread_create(&calculator_threads[i],&attr,main_calculator,(void *) i);
 	}
- /*printf("\nParent --> pid is %d\n", getpid());
-	pthread_attr_init(&attr);
-	pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-	pthread_create(&threads[0],&attr,main_reader,(void *) 0);
-	pthread_create(&threads[1],&attr,main_reader,(void *) 1);
-	pthread_create(&threads[2],&attr,main_calculator,NULL);
-	actual_time= time(NULL);
-*/
+
+	//actual_time= time(NULL);
+
+	base_time= time(NULL);
 	while(1){
   	sleep(1);
+
+		current_time= time(NULL);
+		delta_time= current_time - base_time;
+		if(delta_time >= I){
+			fprintf(stderr,"TAKING %d SAMPLES!\n ",Q);
+			readyForSample= TRUE;
+			base_time= time(NULL);
+		}
+
+		samplesTaken= TRUE;
+		for(i=0; i < processes_count && readyForSample == TRUE; i++){
+			if(samplesCounterBuffer[i] != Q){
+				fprintf(stderr,"Counter in index %d is not ready yet: %d\n ",i,samplesCounterBuffer[i]);
+				samplesTaken= FALSE;
+			}
+		}
+
+		if(samplesTaken && readyForSample){
+			for(i=0; i < processes_count; i++){
+				samplesCounterBuffer[i] = 0;
+			}
+			readyForSample= FALSE;
+			fprintf(stderr,"SAMPLES TAKEN, RESTARTING INTERVAL\n ");
+			base_time= time(NULL);
+			samplesTaken=FALSE;
+		}
 		/*/Analytics code
 		elapsed_time= time(NULL);
 		if(elapsed_time - actual_time >=5){
@@ -319,36 +360,52 @@ void *main_reader(void *param){
 	char valueData[SHMSZ];
 	char oldDataValue[SHMSZ];
 	int i;
+	int samples=0;
 	idmem= shmem_ids[sensor_index];
 	
-	while(1){	
-		sem_wait(reader_mutexes[sensor_index]);
-		
-		strcpy(valueData,sensorData[sensor_index]); //critical section
+	while(1){
+		//Checking if we have reached the interval time
+		//if(readySampling == FALSE && delta_time >= I){
+		//	readySampling= TRUE;
+		//}	
+		if(!readyForSample){
+			samples= 0;
+		}
 
-		sem_post(reader_mutexes[sensor_index]);
-		
-		
-		if(strcmp(oldDataValue,valueData)!=0){
-			fprintf(logfp,"Reading from %s sensor %d: %s\n",(sensor_index % 2 == 0 ? "LASER" : "GSCOPE"),idmem,valueData);
-			fflush(logfp);
-			sem_wait(&buffer_mutexes[(int) sensor_index/2]);
+		if(readyForSample && samples < Q){
+			sem_wait(reader_mutexes[sensor_index]);
+			
+			strcpy(valueData,sensorData[sensor_index]); //critical section
 
-			//If laser data was written
-			if(strcmp(valueData,"")!=0 && sensor_index % 2 == 0){
-				strcpy(distanceBuffer[(int) sensor_index/2][buffd_in[(int) sensor_index/2]],valueData); //critical zone
-				buffd_in[(int) sensor_index/2]= (buffd_in[(int) sensor_index/2] + 1) % BUFFER_SIZE;
+			sem_post(reader_mutexes[sensor_index]);
+			
+			
+			if(strcmp(oldDataValue,valueData)!=0){
+				fprintf(logfp,"Reading from %s sensor %d: %s\n",(sensor_index % 2 == 0 ? "LASER" : "GSCOPE"),idmem,valueData);
+				fflush(logfp);
+				sem_wait(&buffer_mutexes[(int) sensor_index/2]);
+
+				//If laser data was written
+				if(strcmp(valueData,"")!=0 && sensor_index % 2 == 0){
+					strcpy(distanceBuffer[(int) sensor_index/2][buffd_in[(int) sensor_index/2]],valueData); //critical zone
+					buffd_in[(int) sensor_index/2]= (buffd_in[(int) sensor_index/2] + 1) % BUFFER_SIZE;
+					samplesCounterBuffer[sensor_index]= samplesCounterBuffer[sensor_index] + 1;
+					samples++;
+				}
+
+				//If gscope data was written
+				else if(strcmp(valueData,"")!=0 && sensor_index % 2 != 0){
+					strcpy(gscopeBuffer[(int) sensor_index/2][buffg_in[(int) sensor_index/2]],valueData); //critical zone
+					buffg_in[(int) sensor_index/2]= (buffg_in[(int) sensor_index/2] + 1) % BUFFER_SIZE;
+					samplesCounterBuffer[sensor_index]= samplesCounterBuffer[sensor_index] + 1;
+					samples++;
+				}
+			
+				sem_post(&buffer_mutexes[(int) sensor_index/2]);
+
+				strcpy(oldDataValue,valueData);			
 			}
 
-			//If gscope data was written
-			else if(strcmp(valueData,"")!=0 && sensor_index % 2 != 0){
-				strcpy(gscopeBuffer[(int) sensor_index/2][buffg_in[(int) sensor_index/2]],valueData); //critical zone
-				buffg_in[(int) sensor_index/2]= (buffg_in[(int) sensor_index/2] + 1) % BUFFER_SIZE;
-			}
-		
-			sem_post(&buffer_mutexes[(int) sensor_index/2]);
-
-			strcpy(oldDataValue,valueData);			
 		}
 		sleep(1);
 	}
@@ -388,7 +445,7 @@ void *main_calculator(void *param){
 			buffg_out[buffer_index]= buffg_out[buffer_index] + 1;
 			num_readings++;
 			angles_sum+=angle;
-			op_per_sec++;
+			//op_per_sec++;
 		}
 		else if(distance!=0 && strcmp(gscopeBuffer[buffer_index][buffg_out[buffer_index]],"--")== 0){
 			if(num_readings==0){
@@ -404,11 +461,13 @@ void *main_calculator(void *param){
 												angles_sum / num_readings,
 												result);
 			fflush(reslogfp);
-			buffd_out[buffer_index]= buffd_out[buffer_index] + 1;
-			buffg_out[buffer_index]= buffg_out[buffer_index] + 1;
-			op_per_sec++;
+			buffd_out[buffer_index]= (buffd_out[buffer_index] + 1) % BUFFER_SIZE;
+			buffg_out[buffer_index]= (buffg_out[buffer_index] + 1) % BUFFER_SIZE;
+			//op_per_sec++;
 		}
-			
+
+		//Aqui empieza el analisis de los sensores
+
 	}
 	
 }
