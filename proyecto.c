@@ -173,7 +173,7 @@ int main(int argc, const char * argv[])
 	for(i=0; (i < MAX_CONFIG_ARGS) && (token != NULL) ; i++){
 			printf("%s\n",token);
 			if(i>0 && atoi(token) == 0){
-				fprintf(stderr,"ERROR PARSING CONFIG VALUES! Value %s must be an integer number",token);	
+				fprintf(stderr,"ERROR PARSING CONFIG VALUES! Value %s must be an integer number greater than zero\n",token);	
 				return 1;
 			}
 			config_tokens[i]= token;
@@ -181,13 +181,22 @@ int main(int argc, const char * argv[])
 	}
 
 	if(i != MAX_CONFIG_ARGS){
-		fprintf(stderr,"MISS CONFIG ERROR! Insuficient parameters found in config file! (found %d, required %d)",i,MAX_CONFIG_ARGS);
+		fprintf(stderr,"MISS CONFIG ERROR! Insuficient parameters found in config file! (found %d, required %d)\n",i,MAX_CONFIG_ARGS);
 		return 1;
 	}
 
 	//Initial reading process values
 	I= atoi(config_tokens[1]);
+	if(I <=0){
+		fprintf(stderr,"MISS CONFIG ERROR! 'I' cannot be less or equal than zero\n");
+		return 1;
+	}
+
 	Q= atoi(config_tokens[2]);
+	if(Q <=0){
+		fprintf(stderr,"MISS CONFIG ERROR! 'Q' cannot be less or equal than zero\n");
+		return 1;
+	}
 	Q_backup= Q;
 	
 	//tokenizing shared memory ids
@@ -196,14 +205,14 @@ int main(int argc, const char * argv[])
 		printf("%s\n",token);
 		shmem_ids[i]= atoi(token);
 		if(shmem_ids[i] == 0){
-			fprintf(stderr,"ERROR PARSING SHARED MEM IDS! Value %s must be an integer number",token);
+			fprintf(stderr,"ERROR PARSING SHARED MEM IDS! Value %s must be an integer number\n",token);
 			return 1;
 		}
 		token= strtok(NULL,id_sep);
 	}
 
 	if(i % 2 != 0){
-		fprintf(stderr,"MISS CONFIG ERROR! You must provide each ID of laser and gscope, not only 1 of them (%d found) ",i);
+		fprintf(stderr,"MISS CONFIG ERROR! You must provide each ID of laser and gscope, not only 1 of them (%d found) \n",i);
 		return 1;
 	}
 
