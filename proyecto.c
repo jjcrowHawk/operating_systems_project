@@ -13,6 +13,7 @@
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #define BUFFER_SIZE 100
 #define PROC_END 2
@@ -57,6 +58,9 @@ sem_t *buffer_mutexes;
 /* File to load configs of sensors */
 FILE *configfp;
 
+/*File where changes to I,Q,W,T will be applied*/
+FILE *changesfp;
+
 /* Files to write results*/
 FILE *logfp;
 FILE *reslogfp;
@@ -72,6 +76,8 @@ int I = 10;
 int Q = 5;
 float T = 0.9;
 float W = 3.0;
+int Q_backup= 5;
+
 
 /* vars used for sensors sampling */
 time_t base_time;
@@ -82,6 +88,10 @@ int * samplesCounterBuffer;
 float ** samplesBuffer;
 float * means;
 
+/* vars used for configs change control */
+unsigned int onConfigChange= FALSE;
+struct stat fileStat;
+
 
 
 //prototypes
@@ -91,6 +101,7 @@ void sigchild_handler(int sig);
 void siguser_handler(int sig);
 void *main_reader(void *param);
 void *main_calculator(void *param);
+void *changes_monitor(void *param);
 
 
 /*=====Main Program (Main Process)=====*/
@@ -107,6 +118,7 @@ int main(int argc, const char * argv[])
 	key_t shmemKey;
 	pthread_t *reading_threads;
 	pthread_t *calculator_threads;
+	pthread_t cmonitor_thread;
 	pthread_attr_t attr;
 
 	//vars for fetching and parsing configs
@@ -176,6 +188,7 @@ int main(int argc, const char * argv[])
 	//Initial reading process values
 	I= atoi(config_tokens[1]);
 	Q= atoi(config_tokens[2]);
+	Q_backup= Q;
 	
 	//tokenizing shared memory ids
 	token=strtok(config_tokens[0],id_sep);
@@ -273,12 +286,14 @@ int main(int argc, const char * argv[])
 	for(i=0; i< (int) processes_count/2; i++){
 		pthread_create(&calculator_threads[i],&attr,main_calculator,(void *) i);
 	}
-
+	pthread_create(&cmonitor_thread,&attr,changes_monitor,NULL);
+	
 	//actual_time= time(NULL);
 
 	base_time= time(NULL);
 	while(1){
   		sleep(1);
+		
 
 		current_time= time(NULL);
 		delta_time= current_time - base_time;
@@ -290,7 +305,7 @@ int main(int argc, const char * argv[])
 
 		samplesTaken= TRUE;
 		for(i=0; i < processes_count && readyForSample == TRUE; i++){
-			if(samplesCounterBuffer[i] != Q){
+			if(samplesCounterBuffer[i] != Q_backup){
 				fprintf(stderr,"Counter in index %d is not ready yet: %d\n ",i,samplesCounterBuffer[i]);
 				samplesTaken= FALSE;
 			}
@@ -308,7 +323,7 @@ int main(int argc, const char * argv[])
 
 		samplesBufferFull=TRUE;
 		for(i=0;i < (int)processes_count / 2; i++){
-			if(samplesBuffer[i][Q -1] == 0){
+			if(samplesBuffer[i][Q_backup -1] == 0){
 				samplesBufferFull=FALSE;
 				break;
 			}
@@ -320,11 +335,11 @@ int main(int argc, const char * argv[])
 			lstdev= 0;
 			for(i=0; i < (int)processes_count / 2; i++){
 				acum= 0.0;
-				for(j= 0; j< Q; j++){
+				for(j= 0; j< Q_backup; j++){
 					acum+= samplesBuffer[i][j];
 					samplesBuffer[i][j]=0;
 				}
-				means[i]= acum / Q;
+				means[i]= acum / Q_backup;
 				lasersMean+= means[i];
 				fprintf(stderr,"||LASER %d mean distance: %.2f||\n",i,means[i]);
 			}
@@ -337,14 +352,17 @@ int main(int argc, const char * argv[])
 
 			//We always assume that the first laser sensor is the CENTRAL LASER
 
-			isVehicle=TRUE;
 			fprintf(stderr,"VALUE OF VH TRESHOLD: %.2f\n",T * lstdev);
+			fprintf(stderr,"VALUE OF OB TRESHOLD: %.2f\n",W * lstdev);
+
+			isVehicle= TRUE;
+			isObstacle= FALSE;
 			for(i=1; i< (int) processes_count / 2; i++){
 				fprintf(stderr,"DIFFERENCE: %.2f\n",fabs(means[0] - means[i]));
 				if(fabs(means[0] - means[i]) > (T * lstdev)){
 					isVehicle= FALSE;
 				}
-				if(fabs(means[0] - means[i]) >= (W * lstdev)){
+				if(fabs(means[0] - means[i]) == (W * lstdev)){
 					isObstacle= TRUE;
 				}
 			}
@@ -355,11 +373,10 @@ int main(int argc, const char * argv[])
 			}
 			
 			if(!isObstacle){
-				fprintf(stderr,"VALUE OF OB TRESHOLD: %.2f\n",W * lstdev);
 				for(i=1; i< (int) processes_count / 2; i++){
 					for(j= i + 1; j< (int) processes_count / 2; j++){
 						fprintf(stderr,"DIFFERENCE: %.2f\n",fabs(means[i] - means[j]));
-						if(fabs(means[i] - means[j]) >= (W * lstdev)){
+						if(fabs(means[i] - means[j]) == (W * lstdev)){
 							isObstacle= TRUE;
 							break;
 						}
@@ -376,6 +393,16 @@ int main(int argc, const char * argv[])
 				fprintf(stderr,"\n<<<<Object is UNKNOWN>>>>\n");
 			}
 
+			//Allocating  memory for more or less samples if Q value was changed!
+			if(Q_backup != Q){
+				for(i=0; i < (int) processes_count / 2; i++){
+					free(samplesBuffer[i]);
+					samplesBuffer[i]= (float *) calloc(Q,sizeof(float));
+				}
+				Q_backup= Q;
+			}
+			
+			samplesBufferFull=FALSE;
 		}
 		/*/Analytics code
 		elapsed_time= time(NULL);
@@ -387,13 +414,14 @@ int main(int argc, const char * argv[])
 			round_counter++;
 		}
 		/*/
-  }
-  for(i= 0; i < (int) processes_count / 2 ; i++){
+  	}
+
+	for(i= 0; i < (int) processes_count / 2 ; i++){
 		sem_destroy(&buffer_mutexes[i]);
 	}
 	fclose(logfp);
 	fclose(reslogfp);
-  return 0;
+	return 0;
 }
 
 
@@ -454,7 +482,7 @@ void *main_reader(void *param){
 			samples= 0;
 		}
 
-		if(readyForSample && samples < Q){
+		if(readyForSample && samples < Q_backup){
 			sem_wait(reader_mutexes[sensor_index]);
 			
 			strcpy(valueData,sensorData[sensor_index]); //critical section
@@ -514,7 +542,7 @@ void *main_calculator(void *param){
 		
 		sem_post(&buffer_mutexes[buffer_index]);
 		
-		if(sampleIndex == Q){
+		if(sampleIndex == Q_backup){
 			sampleIndex=0;
 		}
 
@@ -564,6 +592,87 @@ void *main_calculator(void *param){
 
 	}
 	
+}
+
+/*-----Changes Monitor routine (Thread)-----*/
+void *changes_monitor(void *param){
+	time_t oldModifiedTime= time(NULL);
+	char * var_token;
+	char * values_token;
+	char * values[2];
+	char * confs_string;
+	const char sep[2]= ",";
+	const char var_sep[2]= "=";
+	char * saveptr1;
+	char * saveptr2;
+	int fd = -1;
+	int i;
+	int j;
+	long size;
+	while(1){
+		sleep(2);
+		changesfp= fopen("changes.cfg","r");
+		if(changesfp != NULL){
+			fd = fileno(changesfp);
+			if(fstat(fd,&fileStat) < 0){
+				fprintf(stderr,"@@Cant get changes file info!\n");
+				continue;	
+			}
+			if((fileStat.st_mtime - oldModifiedTime) > 0){
+				fprintf(stderr,"** FILE WAS RECENTLY MODIFIED! **\n");
+				oldModifiedTime= fileStat.st_mtime;
+
+				fseek(changesfp,0,SEEK_END);
+				size= ftell(changesfp);
+				rewind(changesfp);
+				confs_string= malloc(size + 1);
+				fread(confs_string,size,1,changesfp);
+				fclose(changesfp);
+				
+				var_token= strtok_r(confs_string,sep,&saveptr1);
+				for(i=0; var_token != NULL; i++){
+						values[0]= strtok_r(var_token,var_sep,&saveptr2);
+						values[1]= strtok_r(saveptr2,var_sep,&saveptr2);
+						
+						if(values[0] != NULL && values[1] != NULL){
+							if(strcmp(values[0],"w")==0 || strcmp(values[0],"W")==0){
+								fprintf(stderr,"$$ This value is for obstacle threshold\n\n");
+								if(atof(values[1]) > 1){
+									W= atof(values[1]);
+								}
+							}
+							else if(strcmp(values[0],"t")==0 || strcmp(values[0],"T")==0){
+								fprintf(stderr,"$$ This value is for vehicle threshold\n\n");
+								if(atof(values[1]) > 0 && atof(values[1]) < 1){
+									T= atof(values[1]);
+								}
+							}
+							else if(strcmp(values[0],"q")==0 || strcmp(values[0],"Q")==0){
+								fprintf(stderr,"$$ This value is for no. of samples\n\n");
+								if(atoi(values[1]) > 0){
+									Q= atoi(values[1]);
+								}
+							}
+							else if(strcmp(values[0],"i")==0 || strcmp(values[0],"I")==0){
+								fprintf(stderr,"$$ This value is for sampling interval\n\n");
+								if(atoi(values[1]) > 0){
+									I= atoi(values[1]);
+								}
+							}
+							else{
+								fprintf(stderr,"$$ This value is unknown...ignoring it!\n\n");
+							}
+						}
+
+						var_token= strtok_r(saveptr1,sep,&saveptr1);
+				}
+			}
+		}
+		else{
+			fprintf(stdout,"Changes File does not exist!\n");
+		}
+
+	}
 }
 
 
