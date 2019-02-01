@@ -84,6 +84,8 @@ time_t base_time;
 time_t current_time;
 time_t delta_time;
 unsigned int readyForSample;
+unsigned int samplesTaken= FALSE;
+unsigned int samplesBufferFull= FALSE;
 int * samplesCounterBuffer;
 float ** samplesBuffer;
 float * means;
@@ -129,8 +131,6 @@ int main(int argc, const char * argv[])
 	const char *config_tokens[3];
 
 	//vars for samples buffer checking
-	unsigned int samplesTaken= FALSE;
-	unsigned int samplesBufferFull= FALSE;
 	unsigned int isVehicle= FALSE;
 	unsigned int isObstacle= FALSE;
 	float acum=0.0;
@@ -248,8 +248,9 @@ int main(int argc, const char * argv[])
 	for(i= 0; i < (int) processes_count / 2 ; i++){
 		sem_init(&buffer_mutexes[i],1,1);
 	}
+
+	//Creating the processes that collect sensors values
 	pidp= sensor_processes;
-	
 	for(i=0; i<processes_count; i++){
     pid= fork();
     if(pid<0){
@@ -291,10 +292,18 @@ int main(int argc, const char * argv[])
 	//actual_time= time(NULL);
 
 	base_time= time(NULL);
+
+	/*On this part, the system will be monitoring the intervals,
+	  monitoring counting buffers, samples Buffer and it will
+	  make the computations to check if the object is a vehicle
+	  or an obstracle
+	*/
 	while(1){
   		sleep(1);
-		
 
+		/*Checking if the difference of actual time and base time
+		  is equal or greater than sampling interval
+		*/
 		current_time= time(NULL);
 		delta_time= current_time - base_time;
 		if(delta_time >= I && readyForSample == FALSE){
@@ -303,6 +312,7 @@ int main(int argc, const char * argv[])
 			base_time= time(NULL);
 		}
 
+		//Checking if all the samples of all sensors have been taken
 		samplesTaken= TRUE;
 		for(i=0; i < processes_count && readyForSample == TRUE; i++){
 			if(samplesCounterBuffer[i] != Q_backup){
@@ -311,6 +321,8 @@ int main(int argc, const char * argv[])
 			}
 		}
 
+		/*If all the samples were taken, proceed to
+		free the counter buffer and restart the interval*/
 		if(samplesTaken && readyForSample){
 			for(i=0; i < processes_count; i++){
 				samplesCounterBuffer[i] = 0;
@@ -321,6 +333,8 @@ int main(int argc, const char * argv[])
 			samplesTaken=FALSE;
 		}
 
+		/*Checking if all the samples were processed and stored on
+		samples buffer*/
 		samplesBufferFull=TRUE;
 		for(i=0;i < (int)processes_count / 2; i++){
 			if(samplesBuffer[i][Q_backup -1] == 0){
@@ -329,10 +343,14 @@ int main(int argc, const char * argv[])
 			}
 		}
 		
+		/*If sample buffer is Full, proceed to make computations
+		to determine the type of the object in front of the car*/
 		if(samplesBufferFull){
+			sleep(1);
 			fprintf(stderr,"VALUES BUFFER IS FULL, PROCEED TO CALCULATE...\n");
 			lasersMean=0;
 			lstdev= 0;
+			//Proceed to calculate the mean of each sensor and store it in buffer
 			for(i=0; i < (int)processes_count / 2; i++){
 				acum= 0.0;
 				for(j= 0; j< Q_backup; j++){
@@ -357,6 +375,10 @@ int main(int argc, const char * argv[])
 
 			isVehicle= TRUE;
 			isObstacle= FALSE;
+
+			/*Checking if the difference betweeen edge lasers and central laser
+			applies for the vehicle threshold and if the same difference applies
+			for obstacle threshold*/
 			for(i=1; i< (int) processes_count / 2; i++){
 				fprintf(stderr,"DIFFERENCE: %.2f\n",fabs(means[0] - means[i]));
 				if(fabs(means[0] - means[i]) > (T * lstdev)){
@@ -372,6 +394,8 @@ int main(int argc, const char * argv[])
 				continue;
 			}
 			
+			/*Checking if the difference between edge sensors applies for
+			obstacle threshold*/
 			if(!isObstacle){
 				for(i=1; i< (int) processes_count / 2; i++){
 					for(j= i + 1; j< (int) processes_count / 2; j++){
@@ -389,6 +413,7 @@ int main(int argc, const char * argv[])
 				continue;
 			}
 
+			/* If none of them applies, mark the object as unknown */
 			if(!isVehicle && !isObstacle){
 				fprintf(stderr,"\n<<<<Object is UNKNOWN>>>>\n");
 			}
@@ -474,10 +499,7 @@ void *main_reader(void *param){
 	idmem= shmem_ids[sensor_index];
 	
 	while(1){
-		//Checking if we have reached the interval time
-		//if(readySampling == FALSE && delta_time >= I){
-		//	readySampling= TRUE;
-		//}	
+
 		if(!readyForSample){
 			samples= 0;
 		}
@@ -497,8 +519,10 @@ void *main_reader(void *param){
 
 				//If laser data was written
 				if(strcmp(valueData,"")!=0 && sensor_index % 2 == 0){
+					//store the value of the sensor read in the properly index
 					strcpy(distanceBuffer[(int) sensor_index/2][buffd_in[(int) sensor_index/2]],valueData); //critical zone
 					buffd_in[(int) sensor_index/2]= (buffd_in[(int) sensor_index/2] + 1) % BUFFER_SIZE;
+					//increase sample counter buffer of this sensor
 					samplesCounterBuffer[sensor_index]= samplesCounterBuffer[sensor_index] + 1;
 					samples++;
 				}
@@ -507,6 +531,7 @@ void *main_reader(void *param){
 				else if(strcmp(valueData,"")!=0 && sensor_index % 2 != 0){
 					strcpy(gscopeBuffer[(int) sensor_index/2][buffg_in[(int) sensor_index/2]],valueData); //critical zone
 					buffg_in[(int) sensor_index/2]= (buffg_in[(int) sensor_index/2] + 1) % BUFFER_SIZE;
+					//increase sample counter buffer of this sensor
 					samplesCounterBuffer[sensor_index]= samplesCounterBuffer[sensor_index] + 1;
 					samples++;
 				}
@@ -542,17 +567,18 @@ void *main_calculator(void *param){
 		
 		sem_post(&buffer_mutexes[buffer_index]);
 		
-		if(sampleIndex == Q_backup){
+		//if sample Index reach the limit value, reassing it to zero
+		if(samplesBufferFull){
 			sampleIndex=0;
 		}
 
 		if( distance!=0 && angle!=0){
 			result= distance * cos(angle * (M_PI/180));	
 
+			//store the processed value on the samples buffer on properly index
 			samplesBuffer[buffer_index][sampleIndex]= result;
 			sampleIndex++;
-			//fprintf(stderr,"SAMPLE INDEX OF %d: %d",buffer_index,sampleIndex);
-
+			
 			fprintf(reslogfp,"result of Laser %d distance %f and Gscope %d angle %f: %.3f \n",
 												shmem_ids[2 * buffer_index],
 												distance,
@@ -574,10 +600,10 @@ void *main_calculator(void *param){
 				result= distance * cos((angles_sum / num_readings) * (M_PI/180));
 			}
 
+			//store the processed value on the samples buffer on properly index
 			samplesBuffer[buffer_index][sampleIndex]= result;
 			sampleIndex++;
-			//fprintf(stderr,">>SAMPLE INDEX OF %d: %d\n",buffer_index,sampleIndex);
-
+			
 			fprintf(reslogfp,"result of Laser %d distance %s and Gscope %d angle %f: %f \n",
 												shmem_ids[2 * buffer_index],
 												distanceBuffer[buffer_index][buffd_out[buffer_index]],
@@ -612,16 +638,23 @@ void *changes_monitor(void *param){
 	while(1){
 		sleep(2);
 		changesfp= fopen("changes.cfg","r");
+		//Checking if file exists and we can open it
 		if(changesfp != NULL){
+			//taking the file descriptor
 			fd = fileno(changesfp);
+			//taking the file stats
 			if(fstat(fd,&fileStat) < 0){
 				fprintf(stderr,"@@Cant get changes file info!\n");
 				continue;	
 			}
+			/*if the date of the modified file is greater than last modification
+			time (or initial current time in first instance), then the file was 
+			modified and we have to get its values*/
 			if((fileStat.st_mtime - oldModifiedTime) > 0){
 				fprintf(stderr,"** FILE WAS RECENTLY MODIFIED! **\n");
 				oldModifiedTime= fileStat.st_mtime;
-
+				
+				//Seeking and rewinding pointer to read all once
 				fseek(changesfp,0,SEEK_END);
 				size= ftell(changesfp);
 				rewind(changesfp);
@@ -629,12 +662,21 @@ void *changes_monitor(void *param){
 				fread(confs_string,size,1,changesfp);
 				fclose(changesfp);
 				
+				/*Tokenizing the content of the file
+				  The content of file must have the following format:
+				  
+				  var_name1=val1,var_name2=val2,......var_namen=valn
+				  
+				  if data does not have this format, it will be ignored
+				*/
 				var_token= strtok_r(confs_string,sep,&saveptr1);
 				for(i=0; var_token != NULL; i++){
+						//getting the values of the tokenized variable with its value
 						values[0]= strtok_r(var_token,var_sep,&saveptr2);
 						values[1]= strtok_r(saveptr2,var_sep,&saveptr2);
 						
 						if(values[0] != NULL && values[1] != NULL){
+							//Checking what variable the data represents
 							if(strcmp(values[0],"w")==0 || strcmp(values[0],"W")==0){
 								fprintf(stderr,"$$ This value is for obstacle threshold\n\n");
 								if(atof(values[1]) > 1){
